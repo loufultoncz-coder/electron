@@ -8,7 +8,6 @@
 
 #include "shell/browser/notifications/win/windows_toast_notification.h"
 
-#include <memory>
 #include <string_view>
 
 #include <shlobj.h>
@@ -24,6 +23,7 @@
 #include "base/strings/string_util_win.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/task/thread_pool.h"
+#include "base/threading/sequence_bound.h"
 #include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/browser_thread.h"
 #include "shell/browser/notifications/notification_delegate.h"
@@ -148,14 +148,6 @@ const char* GetTemplateType(bool two_lines, bool has_icon) {
   return two_lines ? kToastText02 : kToastText01;
 }
 
-scoped_refptr<base::SingleThreadTaskRunner> GetToastComStaTaskRunner() {
-  static base::NoDestructor<scoped_refptr<base::SingleThreadTaskRunner>>
-      task_runner(base::ThreadPool::CreateCOMSTATaskRunner(
-          {base::TaskPriority::USER_BLOCKING, base::MayBlock()},
-          base::SingleThreadTaskRunnerThreadMode::DEDICATED));
-  return *task_runner;
-}
-
 bool CreateToastNotifierForCurrentThread(
     ComPtr<winui::Notifications::IToastNotifier>* notifier) {
   ScopedHString toast_manager_str(
@@ -193,15 +185,124 @@ bool CreateToastManagerForCurrentThread(
   return SUCCEEDED(hr);
 }
 
+class ToastStaServiceImpl {
+ public:
+  enum class ShowStatus { kSkipped, kSuccess, kFailure };
+
+  struct ShowResult {
+    ShowStatus status;
+    std::string error;
+  };
+
+  ShowResult Show(
+      ComPtr<ABI::Windows::UI::Notifications::IToastNotification>
+          notification) {
+    if (!notification)
+      return {ShowStatus::kSkipped, std::string()};
+
+    if (!toast_notifier_ && !CreateToastNotifierForCurrentThread(&toast_notifier_))
+      return {ShowStatus::kFailure, "WinAPI: CreateToastNotifier failed"};
+
+    HRESULT hr = toast_notifier_->Show(notification.Get());
+    if (FAILED(hr)) {
+      return {ShowStatus::kFailure,
+              base::StrCat(
+                  {"WinAPI: Show failed, ERROR ", FailureResultToString(hr)})};
+    }
+
+    return {ShowStatus::kSuccess, std::string()};
+  }
+
+  void Hide(ComPtr<ABI::Windows::UI::Notifications::IToastNotification>
+                notification) {
+    if (!toast_notifier_ && !CreateToastNotifierForCurrentThread(&toast_notifier_))
+      return;
+    toast_notifier_->Hide(notification.Get());
+  }
+
+  void Remove(std::string notification_id) {
+    if (!toast_manager_ && !CreateToastManagerForCurrentThread(&toast_manager_))
+      return;
+
+    ComPtr<winui::Notifications::IToastNotificationManagerStatics2>
+        toast_manager2;
+    if (FAILED(toast_manager_.As(&toast_manager2)))
+      return;
+
+    ComPtr<winui::Notifications::IToastNotificationHistory>
+        notification_history;
+    if (FAILED(toast_manager2->get_History(&notification_history)))
+      return;
+
+    ScopedHString app_id;
+    if (!GetAppUserModelID(&app_id))
+      return;
+
+    ScopedHString group(kGroup);
+    ScopedHString tag(GetTag(notification_id));
+    notification_history->RemoveGroupedTagWithId(tag, group, app_id);
+  }
+
+ private:
+  ComPtr<winui::Notifications::IToastNotifier> toast_notifier_;
+  ComPtr<winui::Notifications::IToastNotificationManagerStatics> toast_manager_;
+};
+
+class ToastStaService {
+ public:
+  static ToastStaService& Get() {
+    static base::NoDestructor<ToastStaService> service;
+    return *service;
+  }
+
+  void PostShow(
+      ComPtr<ABI::Windows::UI::Notifications::IToastNotification> notification,
+      base::OnceClosure on_success,
+      base::OnceCallback<void(std::string)> on_error) {
+    impl_.AsyncCall(&ToastStaServiceImpl::Show)
+        .WithArgs(notification)
+        .Then(base::BindOnce(
+            [](base::OnceClosure on_success,
+               base::OnceCallback<void(std::string)> on_error,
+               ToastStaServiceImpl::ShowResult result) {
+              switch (result.status) {
+                case ToastStaServiceImpl::ShowStatus::kSkipped:
+                  return;
+                case ToastStaServiceImpl::ShowStatus::kSuccess:
+                  if (on_success)
+                    std::move(on_success).Run();
+                  return;
+                case ToastStaServiceImpl::ShowStatus::kFailure:
+                  if (on_error)
+                    std::move(on_error).Run(std::move(result.error));
+                  return;
+              }
+            },
+            std::move(on_success), std::move(on_error)));
+  }
+
+  void PostHide(ComPtr<ABI::Windows::UI::Notifications::IToastNotification>
+                    notification) {
+    impl_.AsyncCall(&ToastStaServiceImpl::Hide).WithArgs(notification);
+  }
+
+  void PostRemove(std::string notification_id) {
+    impl_.AsyncCall(&ToastStaServiceImpl::Remove)
+        .WithArgs(std::move(notification_id));
+  }
+
+ private:
+  friend class base::NoDestructor<ToastStaService>;
+
+  ToastStaService()
+      : impl_(base::ThreadPool::CreateCOMSTATaskRunner(
+            {base::TaskPriority::USER_BLOCKING, base::MayBlock()},
+            base::SingleThreadTaskRunnerThreadMode::DEDICATED)) {}
+
+  base::SequenceBound<ToastStaServiceImpl> impl_;
+};
+
 }  // namespace
-
-// static
-ComPtr<winui::Notifications::IToastNotificationManagerStatics>*
-    WindowsToastNotification::toast_manager_ = nullptr;
-
-// static
-ComPtr<winui::Notifications::IToastNotifier>*
-    WindowsToastNotification::toast_notifier_ = nullptr;
 
 // static
 scoped_refptr<base::SequencedTaskRunner>
@@ -216,43 +317,7 @@ WindowsToastNotification::GetToastTaskRunner() {
 }
 
 bool WindowsToastNotification::Initialize() {
-  // Just initialize, don't care if it fails or already initialized.
-  Windows::Foundation::Initialize(RO_INIT_MULTITHREADED);
-
-  ScopedHString toast_manager_str(
-      RuntimeClass_Windows_UI_Notifications_ToastNotificationManager);
-  if (!toast_manager_str.success())
-    return false;
-
-  if (!toast_manager_) {
-    toast_manager_ = new ComPtr<
-        ABI::Windows::UI::Notifications::IToastNotificationManagerStatics>();
-  }
-
-  if (FAILED(Windows::Foundation::GetActivationFactory(
-          toast_manager_str, toast_manager_->GetAddressOf())))
-    return false;
-
-  if (!toast_notifier_) {
-    toast_notifier_ =
-        new ComPtr<ABI::Windows::UI::Notifications::IToastNotifier>();
-  }
-
-  if (IsRunningInDesktopBridge()) {
-    // Ironically, the Desktop Bridge / UWP environment
-    // requires us to not give Windows an appUserModelId.
-    return SUCCEEDED(
-        (*toast_manager_)
-            ->CreateToastNotifier(toast_notifier_->GetAddressOf()));
-  } else {
-    ScopedHString app_id;
-    if (!GetAppUserModelID(&app_id))
-      return false;
-
-    return SUCCEEDED((*toast_manager_)
-                         ->CreateToastNotifierWithId(
-                             app_id, toast_notifier_->GetAddressOf()));
-  }
+  return true;
 }
 
 WindowsToastNotification::WindowsToastNotification(
@@ -482,59 +547,21 @@ void WindowsToastNotification::SetupAndShowOnUIThread(
 
   notif->toast_notification_ = notification;
 
-  auto ui_runner = content::GetUIThreadTaskRunner({});
-  GetToastComStaTaskRunner()->PostTask(
-      FROM_HERE,
-      base::BindOnce(
-          [](ComPtr<ABI::Windows::UI::Notifications::IToastNotification>
-                 notification,
-             base::WeakPtr<Notification> weak_notification,
-             scoped_refptr<base::SingleThreadTaskRunner> ui_runner) {
-            if (!notification)
-              return;
-
-            ComPtr<winui::Notifications::IToastNotifier> notifier;
-            if (!CreateToastNotifierForCurrentThread(&notifier)) {
-              ui_runner->PostTask(
-                  FROM_HERE,
-                  base::BindOnce(
-                      [](base::WeakPtr<Notification> weak_notification) {
-                        if (!weak_notification)
-                          return;
-                        weak_notification->NotificationFailed(
-                            "WinAPI: CreateToastNotifier failed");
-                      },
-                      weak_notification));
-              return;
-            }
-
-            HRESULT hr = notifier->Show(notification.Get());
-            if (FAILED(hr)) {
-              std::string err = base::StrCat(
-                  {"WinAPI: Show failed, ERROR ", FailureResultToString(hr)});
-              ui_runner->PostTask(
-                  FROM_HERE,
-                  base::BindOnce(
-                      [](base::WeakPtr<Notification> weak_notification,
-                         std::string err) {
-                        if (!weak_notification)
-                          return;
-                        weak_notification->NotificationFailed(err);
-                      },
-                      weak_notification, std::move(err)));
-              return;
-            }
-
-            ui_runner->PostTask(
-                FROM_HERE,
-                base::BindOnce(
-                    [](base::WeakPtr<Notification> weak_notification) {
-                      if (weak_notification && weak_notification->delegate())
-                        weak_notification->delegate()->NotificationDisplayed();
-                    },
-                    weak_notification));
-          },
-          notification, weak_notification, ui_runner));
+  auto on_success = base::BindOnce(
+      [](base::WeakPtr<Notification> weak_notification) {
+        if (weak_notification && weak_notification->delegate())
+          weak_notification->delegate()->NotificationDisplayed();
+      },
+      weak_notification);
+  auto on_error = base::BindOnce(
+      [](base::WeakPtr<Notification> weak_notification, std::string err) {
+        if (!weak_notification)
+          return;
+        weak_notification->NotificationFailed(err);
+      },
+      weak_notification);
+  ToastStaService::Get().PostShow(notification, std::move(on_success),
+                                  std::move(on_error));
 }
 
 // Posts a notification failure event back to the UI thread. If the UI thread's
@@ -584,34 +611,7 @@ void WindowsToastNotification::Remove() {
   DebugLog("Removing notification from action center");
 
   std::string notif_id = notification_id();
-  GetToastComStaTaskRunner()->PostTask(
-      FROM_HERE,
-      base::BindOnce(
-          [](std::string notif_id) {
-            ComPtr<winui::Notifications::IToastNotificationManagerStatics>
-                toast_manager;
-            if (!CreateToastManagerForCurrentThread(&toast_manager))
-              return;
-
-            ComPtr<winui::Notifications::IToastNotificationManagerStatics2>
-                toast_manager2;
-            if (FAILED(toast_manager.As(&toast_manager2)))
-              return;
-
-            ComPtr<winui::Notifications::IToastNotificationHistory>
-                notification_history;
-            if (FAILED(toast_manager2->get_History(&notification_history)))
-              return;
-
-            ScopedHString app_id;
-            if (!GetAppUserModelID(&app_id))
-              return;
-
-            ScopedHString group(kGroup);
-            ScopedHString tag(GetTag(notif_id));
-            notification_history->RemoveGroupedTagWithId(tag, group, app_id);
-          },
-          std::move(notif_id)));
+  ToastStaService::Get().PostRemove(std::move(notif_id));
 }
 
 void WindowsToastNotification::Dismiss() {
@@ -622,17 +622,7 @@ void WindowsToastNotification::Dismiss() {
   if (!notification)
     return;
 
-  GetToastComStaTaskRunner()->PostTask(
-      FROM_HERE,
-      base::BindOnce(
-          [](ComPtr<ABI::Windows::UI::Notifications::IToastNotification>
-                 notification) {
-            ComPtr<winui::Notifications::IToastNotifier> notifier;
-            if (!CreateToastNotifierForCurrentThread(&notifier))
-              return;
-            notifier->Hide(notification.Get());
-          },
-          notification));
+  ToastStaService::Get().PostHide(notification);
 }
 
 std::u16string WindowsToastNotification::GetToastXml(

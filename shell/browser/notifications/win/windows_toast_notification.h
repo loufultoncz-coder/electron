@@ -101,12 +101,6 @@ class WindowsToastNotification : public Notification {
       const std::string& error,
       scoped_refptr<base::SingleThreadTaskRunner> ui_task_runner);
 
-  static ComPtr<
-      ABI::Windows::UI::Notifications::IToastNotificationManagerStatics>*
-      toast_manager_;
-  static ComPtr<ABI::Windows::UI::Notifications::IToastNotifier>*
-      toast_notifier_;
-
   // Returns the task runner for toast operations, creating it if necessary.
   static scoped_refptr<base::SequencedTaskRunner> GetToastTaskRunner();
 
